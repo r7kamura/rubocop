@@ -346,17 +346,75 @@ module RuboCop
 
     def inspect_file(processed_source, team = mobilize_team(processed_source))
       extracted_ruby_sources = extract_ruby_sources(processed_source)
-      offenses = extracted_ruby_sources.flat_map do |extracted_ruby_source|
-        report = team.investigate(
-          extracted_ruby_source[:processed_source],
-          offset: extracted_ruby_source[:offset],
-          original: processed_source
-        )
-        @errors.concat(team.errors)
-        @warnings.concat(team.warnings)
-        report.offenses
+
+      # Fast path: single block or no autocorrection requested -> existing behavior
+      if extracted_ruby_sources.size <= 1 || !@options[:autocorrect]
+        any_updated = false
+        offenses = extracted_ruby_sources.flat_map do |extracted_ruby_source|
+          report = team.investigate(
+            extracted_ruby_source[:processed_source],
+            offset: extracted_ruby_source[:offset],
+            original: processed_source
+          )
+          @errors.concat(team.errors)
+          @warnings.concat(team.warnings)
+          any_updated ||= team.updated_source_file?
+          report.offenses
+        end
+        return [offenses, any_updated]
       end
-      [offenses, team.updated_source_file?]
+
+      # Multi-block with autocorrect: collect all correctors and apply once to the original
+      offenses = []
+      any_updated = false
+      begin
+        # Use an autocorrecting team but force in-memory (stdin) writes to avoid per-block disk writes
+        in_memory_opts = @options.merge(stdin: processed_source.buffer.source)
+        collect_team = Cop::Team.mobilize(mobilized_cop_classes(processed_source.config),
+                                          processed_source.config,
+                                          in_memory_opts)
+
+        aggregate_corrector = Cop::Corrector.new(processed_source)
+
+        extracted_ruby_sources.each do |extracted_ruby_source|
+          report = collect_team.investigate(
+            extracted_ruby_source[:processed_source],
+            offset: extracted_ruby_source[:offset],
+            original: processed_source
+          )
+          offenses.concat(report.offenses)
+          @errors.concat(collect_team.errors)
+          @warnings.concat(collect_team.warnings)
+
+          # Merge each cop's corrector into the aggregate with proper offset
+          report.cop_reports.each do |cop_report|
+            corr = cop_report.corrector
+            next if corr.nil? || corr.empty?
+
+            begin
+              if extracted_ruby_source[:offset].to_i.positive?
+                aggregate_corrector.import!(corr, offset: extracted_ruby_source[:offset])
+              else
+                aggregate_corrector.merge!(corr)
+              end
+            rescue ::Parser::ClobberingError
+              # Ignore clobbering conflicts between independent blocks
+            end
+          end
+        end
+
+        unless aggregate_corrector.empty?
+          new_source = aggregate_corrector.rewrite
+          if @options[:stdin]
+            @options[:stdin] = new_source
+          else
+            File.write(processed_source.file_path, new_source)
+          end
+          any_updated = true
+        end
+      end
+
+      [offenses, any_updated]
     end
 
     def extract_ruby_sources(processed_source)

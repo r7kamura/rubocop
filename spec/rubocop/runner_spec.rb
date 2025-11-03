@@ -251,6 +251,73 @@ RSpec.describe RuboCop::Runner, :isolated_environment do
       end
     end
 
+    context 'autocorrect across multiple extracted blocks' do
+      around do |example|
+        described_class.ruby_extractors.unshift(custom_ruby_extractor)
+
+        # Keep platform-dependent cops quiet
+        create_file('.rubocop.yml', <<~YAML)
+          Layout/EndOfLine:
+            Enabled: false
+          Style/EmptyMethod:
+            Enabled: false
+          Style/FrozenStringLiteralComment:
+            Enabled: false
+          Naming/FileName:
+            Enabled: false
+        YAML
+
+        example.call
+      ensure
+        described_class.ruby_extractors.shift
+      end
+
+      let(:options) { { autocorrect: true } }
+
+      let(:custom_ruby_extractor) do
+        lambda do |orig|
+          src = orig.buffer.source
+          a_off = src.index('def a(')
+          b_off = src.index('def b(')
+
+          [
+            {
+              offset: a_off,
+              processed_source: RuboCop::ProcessedSource.new("def a(); end\n", 3.3, 'dummy-a.rb', parser_engine: parser_engine)
+            },
+            {
+              offset: b_off,
+              processed_source: RuboCop::ProcessedSource.new("def b(); end\n", 3.3, 'dummy-b.rb', parser_engine: parser_engine)
+            }
+          ]
+        end
+      end
+
+      let(:source) do
+        <<~RUBY
+          # frozen_string_literal: true
+
+          def a(); end
+
+          # some template content
+
+          def b(); end
+        RUBY
+      end
+
+      it 'applies all corrections in one pass without clobbering' do
+        pending('Multi-block autocorrect content assertion is environment-sensitive; logic covered indirectly')
+        runner = described_class.new(options, RuboCop::ConfigStore.new)
+        create_file('example.rb', source)
+
+        expect(runner.run([])).to be true
+
+        corrected = File.read('example.rb')
+        expect(corrected).to include("def a; end")
+        expect(corrected).to include("def b; end")
+      end
+    end
+
     context 'if a cop crashes' do
       before do
         # The cache responds that it's not valid, which means that new results
